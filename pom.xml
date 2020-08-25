@@ -44,19 +44,6 @@
 
     </dependencyManagement>
 
-    <!-- ==================== 发布 =========================== -->
-    <distributionManagement>
-        <repository>
-            <id>jdb-dev</id>
-            <name>Local Nexus Repository2</name>
-            <url>http://mvn.jdb-dev.com/content/repositories/releases/</url>
-        </repository>
-        <snapshotRepository>
-            <id>jdb-dev</id>
-            <name>Nexus snapshots Repository</name>
-            <url>http://mvn.jdb-dev.com/content/repositories/snapshots/</url>
-        </snapshotRepository>
-    </distributionManagement>
 
     <build>
         <plugins>
