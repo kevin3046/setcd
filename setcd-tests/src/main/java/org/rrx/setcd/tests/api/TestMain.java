@@ -36,5 +36,6 @@ public class TestMain {
             System.out.println("putValue."+dataId+"===================>" + v);
             Thread.sleep(3000L);
         }
+        SetcdClientUtils.deleteValue(dataId);
     }
 }

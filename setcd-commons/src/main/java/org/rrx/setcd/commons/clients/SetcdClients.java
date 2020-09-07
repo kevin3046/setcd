@@ -1,15 +1,21 @@
 package org.rrx.setcd.commons.clients;
 
 import io.etcd.jetcd.*;
+import io.etcd.jetcd.kv.DeleteResponse;
 import io.etcd.jetcd.kv.GetResponse;
 import io.etcd.jetcd.kv.PutResponse;
+import io.etcd.jetcd.lease.LeaseKeepAliveResponse;
 import io.etcd.jetcd.options.GetOption;
 import io.etcd.jetcd.options.WatchOption;
 import io.etcd.jetcd.watch.WatchEvent;
 import io.etcd.jetcd.watch.WatchResponse;
+import io.grpc.stub.StreamObserver;
 import org.rrx.setcd.commons.config.EtcdConfigProperties;
+import org.rrx.setcd.commons.election.ElectionCandidate;
 import org.rrx.setcd.commons.event.Listener;
 import org.rrx.setcd.commons.event.SetcdEventBean;
+import org.rrx.setcd.commons.logging.Log;
+import org.rrx.setcd.commons.logging.LogFactory;
 import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.context.ApplicationContext;
@@ -21,11 +27,11 @@ import org.springframework.context.event.ContextStoppedEvent;
 import org.springframework.util.StringUtils;
 
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -35,6 +41,8 @@ import java.util.function.Consumer;
  * @Description:
  */
 public class SetcdClients implements ApplicationContextAware, ApplicationListener, InitializingBean {
+
+    private final static Log log = LogFactory.getLog(SetcdClients.class);
 
     private ApplicationContext applicationContext;
 
@@ -46,12 +54,15 @@ public class SetcdClients implements ApplicationContextAware, ApplicationListene
 
     private Client client;
 
+    private ScheduledExecutorService scheduledThreadPool = Executors.newScheduledThreadPool(2);
+
     public SetcdClients(EtcdConfigProperties etcdConfigProperties) {
         this.etcdConfigProperties = etcdConfigProperties;
     }
 
 
     public String getValue(String key) throws Exception {
+        log.info("key===>"+key);
         String value = "";
         KV kvClient = client.getKVClient();
         ByteSequence byteSequence = ByteSequence.from(key, StandardCharsets.UTF_8);
@@ -61,6 +72,35 @@ public class SetcdClients implements ApplicationContextAware, ApplicationListene
             value = Optional.ofNullable(keyValue.getValue()).map(v -> v.toString(StandardCharsets.UTF_8)).orElse("");
         }
         return value;
+    }
+
+    public List<KeyValueBean> getValue(String key,GetOptionBuilder builder) throws Exception {
+        log.info("key===>"+key);
+        List<KeyValueBean> result = new ArrayList<>();
+        String tValue = "";
+        String tKey = "";
+
+        GetOption getOption = builder.build();
+        KV kvClient = client.getKVClient();
+        ByteSequence byteSequence = ByteSequence.from(key, StandardCharsets.UTF_8);
+        GetResponse getResponse = kvClient.get(byteSequence,getOption).get();
+        if (getResponse.getKvs().size() > 0) {
+
+            for(KeyValue keyValue:getResponse.getKvs()){
+                tKey = Optional.ofNullable(keyValue.getKey()).map(v -> v.toString(StandardCharsets.UTF_8)).orElse("");
+                tValue = Optional.ofNullable(keyValue.getValue()).map(v -> v.toString(StandardCharsets.UTF_8)).orElse("");
+                KeyValueBean keyValueBean = new KeyValueBean(tKey,tValue);
+                result.add(keyValueBean);
+            }
+        }
+        return result;
+    }
+
+    public Long delValue(String key) throws Exception {
+        KV kvClient = client.getKVClient();
+        ByteSequence byteSequence = ByteSequence.from(key, StandardCharsets.UTF_8);
+        DeleteResponse deleteResponse = kvClient.delete(byteSequence).get();
+        return deleteResponse.getDeleted();
     }
 
     public Long putValue(String key, String value) throws Exception {
@@ -84,8 +124,93 @@ public class SetcdClients implements ApplicationContextAware, ApplicationListene
                 consumer.accept(buildEventBean(event));
             }
         });
-
     }
+
+    /**
+     * https://my.oschina.net/keking/blog/3077923/print
+     * @param key
+     * @param lockTTl
+     * @param electionCandidate
+     * @throws Exception
+     */
+    public void election(String key,Long lockTTl,ElectionCandidate electionCandidate) throws Exception{
+
+        Lease lease = client.getLeaseClient();
+        Lock lock = client.getLockClient();
+        ByteSequence lockKey = ByteSequence.from(key, StandardCharsets.UTF_8);
+
+        long leaseId = lease.grant(lockTTl).get().getID();
+
+        log.info("election leaseId====="+leaseId);
+
+        lease.keepAlive(leaseId, new StreamObserver<LeaseKeepAliveResponse>() {
+            @Override
+            public void onNext(LeaseKeepAliveResponse value) {
+                log.info("LeaseKeepAliveResponse value:"+ value.getTTL());
+            }
+
+            @Override
+            public void onError(Throwable t) {
+                t.printStackTrace();
+                log.error("发送了错误======================>onError");
+                lease.revoke(leaseId);
+                electionCandidate.onError(t);
+            }
+
+            @Override
+            public void onCompleted() {
+                log.error("发送了错误======================>onCompleted");
+                lease.revoke(leaseId);
+                electionCandidate.onCompleted();
+
+            }
+        });
+        lock.lock(lockKey, leaseId).get().getKey();
+        log.info("开始执行startLeadership");
+        electionCandidate.startLeadership();
+//        scheduledThreadPool.submit(() -> {
+//            while (true) {
+//                System.err.println("我是主服务开始工作了");
+//                TimeUnit.SECONDS.sleep(1);
+//            }
+//        });
+//        TimeUnit.DAYS.sleep(1);
+    }
+
+//    public void election2() throws Exception{
+//
+//        Lease lease = client.getLeaseClient();
+//        Lock lock = client.getLockClient();
+//        long lockTTl = 1;
+//        ByteSequence lockKey = ByteSequence.from("/root/lock", StandardCharsets.UTF_8);
+//
+//        long leaseId = lease.grant(lockTTl).get().getID();
+//
+//        lease.keepAlive(leaseId, new StreamObserver<LeaseKeepAliveResponse>() {
+//            @Override
+//            public void onNext(LeaseKeepAliveResponse value) {
+//                System.err.println("LeaseKeepAliveResponse value:"+ value.getTTL());
+//            }
+//
+//            @Override
+//            public void onError(Throwable t) {
+//                t.printStackTrace();
+//            }
+//
+//            @Override
+//            public void onCompleted() {
+//            }
+//        });
+//        lock.lock(lockKey, leaseId).get().getKey();
+//
+//        scheduledThreadPool.submit(() -> {
+//            while (true) {
+//                System.err.println("我是备用服务，我开始工作了，估计主服务已经挂了");
+//                TimeUnit.SECONDS.sleep(1);
+//            }
+//        });
+//        TimeUnit.DAYS.sleep(1);
+//    }
 
     public void watch(String key, Consumer<SetcdEventBean> consumer,boolean prefix) {
 
